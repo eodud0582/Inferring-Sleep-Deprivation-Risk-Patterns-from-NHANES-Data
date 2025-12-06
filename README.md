@@ -101,6 +101,7 @@ install.packages(c("tidyverse", "caret", "glmnet", "pROC", "haven"))
 3.  **Modeling**:
       * Run `03_modeling_dk.ipynb` for Machine Learning models.
       * Run `glm_model.Rmd` for statistical GLM analysis.
+      * Run `NHANES_nnet.ipynb` for MLP model.
 
 ## My Contribution
 
