@@ -1004,4 +1004,3 @@ ggplot(filtered_data, aes(x = weekday_sleep_timing, y = pct_deprived,
   ylim(0, 100)  # Set y-axis from 0 to 100%
 ```
 
-
