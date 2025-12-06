@@ -51,7 +51,7 @@ This repository is structured to follow a standard data science pipeline, from r
 
 ### 3\. Predictive Modeling & Evaluation
 
-  * **File**: `03_modeling_dk.ipynb` (Python) & `glm_model.Rmd` (R)
+  * **File**: `03_modeling_dk.ipynb` (Python), `NHANES_nnet.ipynb` (Python) & `glm_model.Rmd` (R)
   * **Description**:
       * **Baseline**: Rule-based classifier using domain knowledge.
       * **Advanced Models**:
@@ -104,7 +104,7 @@ install.packages(c("tidyverse", "caret", "glmnet", "pROC", "haven"))
 
 ## My Contribution
 
-  * Data Cleaning, Preprocessing, ML Modeling
+  * Data Cleaning, Preprocessing, ML Modeling (`01_data_eda_clean_dk.ipynb`, `02_data_preparation_dk.ipynb`, `03_modeling_dk.ipynb`)
 
 ---
 ## License
