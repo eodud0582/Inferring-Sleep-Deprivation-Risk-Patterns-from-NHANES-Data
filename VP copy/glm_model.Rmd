@@ -1,0 +1,1006 @@
+---
+title: "glm_model"
+output: pdf_document
+date: "`r Sys.Date()`"
+---
+
+
+```{r}
+library(MASS)
+library(car)
+library(glmnet)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(dplyr)
+```
+
+
+Read data
+
+```{r}
+# Read the data
+X_train <- read.csv("Dataset_final\\X_train.csv")
+y_train <- read.csv("Dataset_final\\y_train.csv")
+X_test <- read.csv("Dataset_final\\X_test.csv")
+y_test <- read.csv("Dataset_final\\y_test.csv")
+
+# Remove the index column from both datasets
+# Both datasets have unnamed first column (shown as '')
+X_train <- X_train[, -1]
+y_train <- y_train[, -1]
+
+X_test <- X_test[, -1]
+y_test <- y_test[, -1]
+
+if(colnames(X_test)[1] == "") X_test <- X_test[, -1]
+
+# Fix Data
+train_data <- cbind(X_train, is_sleep_deprived = y_train)
+train_data$respondent_id <- NULL
+train_data$race_hispanic_origin <- NULL
+
+test_data <- cbind(X_test, is_sleep_deprived = y_test)
+test_data$respondent_id <- NULL
+test_data$race_hispanic_origin <- NULL
+
+colnames(test_data)[colnames(test_data) == "sleep_risk_category"] <- "weekday_sleep_timing"
+
+
+# Create binary sleep risk variable using correct variable name
+test_data$weekday_sleep_timing <- with(test_data, {
+  hr <- as.numeric(as.character(sleep_time_weekdays_usual_hours))
+  ifelse(hr >= 18 & hr <= 23, "Low Risk", "High Risk")
+})
+
+# Convert to factor with appropriate levels
+test_data$weekday_sleep_timing <- factor(test_data$weekday_sleep_timing, 
+                                         levels = c("High Risk", "Low Risk"))
+
+
+
+# Rename the column name to avoid confusion
+colnames(train_data)[colnames(train_data) == "sleep_risk_category"] <- "weekday_sleep_timing"
+colnames(X_test)[colnames(X_test)       == "sleep_risk_category"] <- "weekday_sleep_timing"
+
+
+
+# Break the hour
+train_data$sleep_time_weekdays_rounded <- round(train_data$sleep_time_weekdays_usual_hours)
+# train_data$sleep_time_weekends_rounded <- round(train_data$sleep_time_weekends_usual_hours)
+test_data$sleep_time_weekdays_rounded <- round(test_data$sleep_time_weekdays_usual_hours)
+
+# Convert the rounded values to factors
+train_data$sleep_time_weekdays_cat <- factor(train_data$sleep_time_weekdays_rounded)
+# train_data$sleep_time_weekends_cat <- factor(train_data$sleep_time_weekends_rounded)
+test_data$sleep_time_weekdays_cat <- factor(test_data$sleep_time_weekdays_rounded)
+
+
+# Apply same transformation to test data
+X_test$sleep_time_weekdays_rounded <- round(X_test$sleep_time_weekdays_usual_hours)
+# X_test$sleep_time_weekends_rounded <- round(X_test$sleep_time_weekends_usual_hours)
+
+X_test$sleep_time_weekdays_cat <- factor(X_test$sleep_time_weekdays_rounded)
+# X_test$sleep_time_weekends_cat <- factor(X_test$sleep_time_weekends_rounded)
+
+train_data$sleep_time_weekdays_cat <- droplevels(train_data$sleep_time_weekdays_cat)
+X_test$sleep_time_weekdays_cat <- droplevels(X_test$sleep_time_weekdays_cat)
+test_data$sleep_time_weekdays_cat <- droplevels(test_data$sleep_time_weekdays_cat)
+
+
+
+# --- coarse 3-level bin for weekday start hour ------------------------------
+
+# get_hour_group <- function(hour_factor) {
+#   hr <- as.numeric(as.character(hour_factor))  # Ensure hour is numeric (0–23)
+#   grp <- ifelse(hr >= 2 & hr <= 6, "Very Early",
+#          ifelse(hr >= 9 & hr <= 11, "Morning High Risk",
+#          ifelse(hr >= 18 & hr <= 23, "Evening",
+#                 "Early Morning + Midday")))  # Default: 00:00-01:00, 07:00-17:00
+#   factor(grp, levels = c("Evening", "Early Morning + Midday", "Morning High Risk", "Very Early"))
+# }
+
+
+
+# train_data$weekday_start_bin <- get_hour_group(train_data$sleep_time_weekdays_cat)
+# X_test$weekday_start_bin     <- get_hour_group(X_test$sleep_time_weekdays_cat)
+# test_data$weekday_start_bin     <- get_hour_group(test_data$sleep_time_weekdays_cat)
+# 
+# train_data$weekday_start_bin <- droplevels(train_data$weekday_start_bin)
+# X_test$weekday_start_bin     <- droplevels(X_test$weekday_start_bin)
+
+# drop the fine-grained hour factor to avoid redundancy
+# train_data$sleep_time_weekdays_cat <- NULL
+# X_test$sleep_time_weekdays_cat     <- NULL
+
+
+
+
+
+train_data$sleep_time_weekdays_rounded <- NULL
+X_test$sleep_time_weekdays_rounded <- NULL
+
+# Remove original variables
+train_data$sleep_time_weekdays_usual_hours <- NULL
+train_data$sleep_time_weekends_usual_hours <- NULL
+X_test$sleep_time_weekdays_usual_hours <- NULL
+X_test$sleep_time_weekends_usual_hours <- NULL
+
+
+write.csv(train_data, "OUTPUT\\train_data_export.csv", row.names = FALSE)
+```
+
+
+```{r}
+# Full model (already defined)
+full_model_raw <- glm(is_sleep_deprived ~ .,
+                 data = train_data, 
+                 family = binomial(link = "logit"))
+
+summary(full_model_raw)
+```
+
+
+
+```{r}
+# Calculate VIF
+vif_values <- vif(full_model_raw)
+print(vif_values)
+high_vif    <- vif_values[vif_values > 5]
+```
+
+```{r}
+# VIF Fremoval
+remove_highest_vif <- function(model, threshold = 2.5, return_model = TRUE) {
+  require(car)
+  gvif_df <- car::vif(model)
+  max_vif <- max(gvif_df[, 3])
+  
+  if (max_vif <= threshold) {
+    message("No variables exceed the VIF threshold of ", threshold)
+    return(model)
+  }
+  
+  highest_idx <- which.max(gvif_df[, 3])
+  highest_var <- rownames(gvif_df)[highest_idx]
+  
+  cat(paste0("Removing: ", highest_var, 
+             " (GVIF = ", round(gvif_df[highest_idx, 1], 4), 
+             ", GVIF^(1/(2*Df)) = ", round(gvif_df[highest_idx, 3], 4), ")\n"))
+  
+  formula_updated <- update(formula(model), paste(". ~ . -", highest_var))
+  
+  if (return_model) {
+    return(update(model, formula_updated))
+  } else {
+    return(formula_updated)
+  }
+}
+
+full_model <- full_model_raw
+threshold <- 5
+
+while (TRUE) {
+ vif_results <- car::vif(full_model)
+ if (max(vif_results[, 3]) <= threshold) {
+   cat("All variables now have VIF below", threshold, "\n")
+   break
+ }
+ full_model <- remove_highest_vif(full_model, threshold = threshold)
+}
+```
+```{r}
+vif_values <- vif(full_model)
+print(vif_values)
+```
+
+
+```{r}
+class_counts <- table(train_data$is_sleep_deprived)
+class_weights <- 1/prop.table(class_counts)
+weights_vector <- ifelse(train_data$is_sleep_deprived == 1, 
+                         class_weights[2], 
+                         class_weights[1])
+```
+
+
+```{r}
+# Null model (intercept only)
+null_model <- glm(is_sleep_deprived ~ 1, 
+                 data = train_data, 
+                 family = binomial(link = "logit"), 
+                 weights = weights_vector)
+
+# Full model (already defined)
+full_model <- update(full_model,
+                     . ~ . 
+                     + weekday_sleep_timing:gender,
+                     # + weekday_sleep_timing:education_level,
+                     # + weekday_sleep_timing:race_hispanic_origin_with_asian,
+                    weights = weights_vector)
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+# bic_backward_model <- suppressWarnings(stepAIC(full_model, 
+#                         scope = list(lower = null_model, upper = full_model), 
+#                         direction = "backward", 
+#                         k = log(nrow(model.frame(null_model))),
+#                         trace = FALSE))
+
+
+```
+
+
+```{r}
+# get_metrics <- function(model, data, y_true) {
+#   prob <- predict(model, newdata = data, type = "response")
+#   pred <- factor(ifelse(prob > 0.5, 1, 0), levels = c(0,1))
+#   
+#   auc  <- roc(y_true, prob, quiet = TRUE)$auc
+#   cm   <- confusionMatrix(pred, factor(y_true, levels = c(0,1)), positive = "1")
+#   
+#   c(
+#     AUC         = as.numeric(auc),
+#     F1          = as.numeric(cm$byClass["F1"]),
+#     Accuracy    = as.numeric(cm$overall["Accuracy"]),
+#     Sensitivity = as.numeric(cm$byClass["Sensitivity"])
+#   )
+# }
+# 
+# # Get both train and test metrics
+# train_metrics <- get_metrics(bic_backward_model, train_data, train_data$is_sleep_deprived)
+# test_metrics <- get_metrics(bic_backward_model, test_data, test_data$is_sleep_deprived)
+# 
+# 
+# # Display results
+# cat("Training metrics:\n")
+# print(train_metrics)
+# 
+# cat("\nTest metrics:\n")
+# print(test_metrics)
+# 
+# summary(bic_backward_model)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# Stepwise forward selection using AIC
+aic_forward_model <- suppressWarnings(stepAIC(null_model, 
+                         scope = list(lower = null_model, upper = full_model), 
+                         direction = "forward", 
+                         trace = FALSE))
+
+# Stepwise backward selection using AIC
+aic_backward_model <- suppressWarnings(stepAIC(full_model, 
+                         scope = list(lower = null_model, upper = full_model), 
+                         direction = "backward", 
+                         trace = FALSE))
+
+# Stepwise both selection using AIC
+aic_both_model <- suppressWarnings(stepAIC(null_model, 
+                         scope = list(lower = null_model, upper = full_model), 
+                         direction = "both", 
+                         trace = FALSE))
+
+# Stepwise forward selection using BIC
+bic_forward_model <- suppressWarnings(stepAIC(null_model, 
+                       scope = list(lower = null_model, upper = full_model), 
+                       direction = "forward", 
+                       k = log(nrow(model.frame(null_model))),
+                       trace = FALSE))
+
+# Stepwise backward selection using BIC
+bic_backward_model <- suppressWarnings(stepAIC(full_model, 
+                        scope = list(lower = null_model, upper = full_model), 
+                        direction = "backward", 
+                        k = log(nrow(model.frame(null_model))),
+                        trace = FALSE))
+
+# Stepwise both selection using BIC
+bic_both_model <- suppressWarnings(stepAIC(null_model, 
+                    scope = list(lower = null_model, upper = full_model), 
+                    direction = "both", 
+                    k = log(nrow(model.frame(null_model))),
+                    trace = FALSE))
+```
+
+
+
+```{r}
+# Create CV folds
+set.seed(123)
+fold_indices <- sample(rep(1:5, length.out=nrow(train_data)))
+
+# Create full model matrix first
+x_full <- model.matrix(is_sleep_deprived ~ ., train_data)[,-1]
+y_full <- train_data$is_sleep_deprived
+
+# Run CV directly
+cv_lasso <- cv.glmnet(x_full, y_full, alpha=1, 
+                     family="binomial", weights=weights_vector,
+                     foldid=fold_indices, type.measure="deviance")
+
+# Get best lambda
+best_lambda <- cv_lasso$lambda.min
+
+# Final model with optimal lambda
+final_lasso <- glmnet(x_full, y_full, alpha=1, 
+                     lambda=best_lambda, family="binomial", 
+                     weights=weights_vector)
+
+x_full <- model.matrix(is_sleep_deprived ~ ., train_data)[,-1]
+y_full <- train_data$is_sleep_deprived
+set.seed(123)
+fold_indices <- sample(rep(1:5, length.out=nrow(train_data)))
+
+# Ridge regression (alpha=0)
+cv_ridge <- cv.glmnet(x_full, y_full, alpha=0, 
+                    family="binomial", weights=weights_vector,
+                    foldid=fold_indices, type.measure="deviance")
+best_lambda_ridge <- cv_ridge$lambda.min
+final_ridge <- glmnet(x_full, y_full, alpha=0, 
+                    lambda=best_lambda_ridge, family="binomial", 
+                    weights=weights_vector)
+
+
+# Setup for tuning alpha and lambda together
+x_full <- model.matrix(is_sleep_deprived ~ ., train_data)[,-1]
+y_full <- train_data$is_sleep_deprived
+set.seed(123)
+fold_indices <- sample(rep(1:5, length.out=nrow(train_data)))
+
+# Define grid of alpha values to try
+alpha_grid <- seq(0, 1, by=0.1)
+cv_results <- list()
+best_cvm <- Inf
+best_alpha <- NULL
+best_lambda <- NULL
+
+# Tune alpha and lambda together
+for (a in alpha_grid) {
+ cv_model <- cv.glmnet(x_full, y_full, alpha=a, 
+                      family="binomial", weights=weights_vector,
+                      foldid=fold_indices, type.measure="deviance")
+ 
+ cv_results[[as.character(a)]] <- cv_model
+ 
+ if (min(cv_model$cvm) < best_cvm) {
+   best_cvm <- min(cv_model$cvm)
+   best_alpha <- a
+   best_lambda <- cv_model$lambda.min
+ }
+}
+
+# Final model with optimal parameters
+final_elastic <- glmnet(x_full, y_full, alpha=best_alpha, 
+                      lambda=best_lambda, family="binomial", 
+                      weights=weights_vector)
+
+```
+
+
+
+```{r}
+# Update the model summary table
+model_summary <- data.frame(
+  Model = c("AIC_Forward", "AIC_Backward", "AIC_Both", 
+            "BIC_Forward", "BIC_Backward", "BIC_Both",
+            "LASSO", "Ridge", "Elastic Net"),
+  Variables = c(length(coef(aic_forward_model)) - 1,
+                length(coef(aic_backward_model)) - 1,
+                length(coef(aic_both_model)) - 1,
+                length(coef(bic_forward_model)) - 1,
+                length(coef(bic_backward_model)) - 1,
+                length(coef(bic_both_model)) - 1,
+                sum(coef(final_lasso)[-1] != 0),
+                sum(coef(final_ridge)[-1] != 0),
+                sum(coef(final_elastic)[-1] != 0)),
+  Best_Parameters = c("", "", "", "", "", "",
+                     paste("lambda =", round(best_lambda, 5)),
+                     paste("lambda =", round(best_lambda_ridge, 5)),
+                     paste("alpha =", best_alpha, ", lambda =", round(best_lambda, 5)))
+)
+
+# Print updated summary table
+print(model_summary)
+```
+
+```{r}
+# Helper function to compute metrics
+get_metrics <- function(model, data, y_true) {
+  prob <- predict(model, newdata = data, type = "response")
+  pred <- factor(ifelse(prob > 0.5, 1, 0), levels = c(0,1))
+  
+  auc  <- roc(y_true, prob, quiet = TRUE)$auc
+  cm   <- confusionMatrix(pred, factor(y_true, levels = c(0,1)), positive = "1")
+  
+  c(
+    AUC         = as.numeric(auc),
+    F1          = as.numeric(cm$byClass["F1"]),
+    Accuracy    = as.numeric(cm$overall["Accuracy"]),
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"])
+  )
+}
+
+# For LASSO, Ridge, Elastic Net (predict differently!)
+get_metrics_glmnet <- function(model, x, y_true) {
+  prob <- predict(model, newx = x, type = "response")[,1]
+  pred <- factor(ifelse(prob > 0.5, 1, 0), levels = c(0,1))
+  
+  auc  <- roc(y_true, prob, quiet = TRUE)$auc
+  cm   <- confusionMatrix(pred, factor(y_true, levels = c(0,1)), positive = "1")
+  
+  c(
+    AUC         = as.numeric(auc),
+    F1          = as.numeric(cm$byClass["F1"]),
+    Accuracy    = as.numeric(cm$overall["Accuracy"]),
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"])
+  )
+}
+
+# --- make test design matrix match the training matrix -----------------------
+# build raw matrix
+x_test <- model.matrix(~ ., data = X_test)[, -1]
+# add any columns seen in training but absent in test (fill with 0)
+missing_cols <- setdiff(colnames(x_full), colnames(x_test))
+if (length(missing_cols)) {
+  x_test <- cbind(
+    x_test,
+    matrix(0, nrow(x_test), length(missing_cols),
+           dimnames = list(NULL, missing_cols))
+  )
+}
+# drop extras and reorder to match training
+x_test <- x_test[, colnames(x_full), drop = FALSE]
+
+# --- Count original variables instead of encoded features ---
+# Function to count original variables from a model
+count_original_variables <- function(model) {
+  # Extract variable names from the model formula
+  if ("terms" %in% names(model)) {
+    var_names <- all.vars(formula(model)[-2])  # Exclude response variable
+    return(length(var_names))
+  } else if (class(model)[1] == "glmnet") {
+    # For glmnet models, we need to count differently
+    # This depends on how you set up your data, adjust as needed
+    # Assuming you have the original variable names stored somewhere
+    return(length(unique(gsub("_.*$", "", colnames(model$beta)))))
+  }
+  return(NA)  # Return NA if can't determine
+}
+
+# --- compute performance metrics for every model ---
+metrics_list <- list(
+  # get_metrics(full_model,  X_test, y_test),
+  # get_metrics(null_model,  X_test, y_test),
+  get_metrics(aic_forward_model,  X_test, y_test),
+  get_metrics(aic_backward_model, X_test, y_test),
+  get_metrics(aic_both_model,     X_test, y_test),
+  get_metrics(bic_forward_model,  X_test, y_test),
+  get_metrics(bic_backward_model, X_test, y_test),
+  get_metrics(bic_both_model,     X_test, y_test),
+  get_metrics_glmnet(final_lasso,   x_test, y_test),
+  get_metrics_glmnet(final_ridge,   x_test, y_test),
+  get_metrics_glmnet(final_elastic, x_test, y_test)
+)
+
+
+
+# Update model_summary with both variables and features
+model_list <- list(
+  aic_forward_model, aic_backward_model, aic_both_model,
+  bic_forward_model, bic_backward_model, bic_both_model,
+  final_lasso, final_ridge, final_elastic
+)
+
+# Keep the existing Features column (rename it)
+model_summary$Features <- model_summary$Variables
+
+# Add new Variables column with original variable counts
+model_summary$Variables <- sapply(model_list, count_original_variables)
+
+# Reorder columns to put Variables before Features
+col_order <- c("Model", "Variables", "Features", "Best_Parameters")
+model_summary <- model_summary[, c(col_order, setdiff(names(model_summary), col_order))]
+
+# bind rows → data-frame, then attach to summary table
+metrics_df <- do.call(rbind, metrics_list)
+model_summary <- cbind(model_summary, as.data.frame(metrics_df))
+print(model_summary)
+```
+
+```{r}
+suppressWarnings(sleep_start_model <- glm(is_sleep_deprived ~ sleep_time_weekdays_cat, 
+                 data = train_data, 
+                 family = binomial(link = "logit"), 
+                 weights = weights_vector))
+
+
+# Compute test metrics
+full_test_metrics <- get_metrics(full_model, X_test, y_test)
+null_test_metrics <- get_metrics(null_model, X_test, y_test)
+sleep_start_test_metrics <- get_metrics(sleep_start_model, X_test, y_test)
+
+# Compute train metrics
+full_train_metrics <- get_metrics(full_model, train_data, train_data$is_sleep_deprived)
+null_train_metrics <- get_metrics(null_model, train_data, train_data$is_sleep_deprived)
+sleep_start_train_metrics <- get_metrics(sleep_start_model, train_data, train_data$is_sleep_deprived)
+
+# Count variables & features
+full_vars     <- count_original_variables(full_model)
+null_vars     <- count_original_variables(null_model)
+sleep_start_vars <- count_original_variables(sleep_start_model)
+
+full_feats    <- ncol(x_full)
+null_feats    <- 0
+sleep_start_feats <- 1  # Assuming sleep_start_model only uses one feature
+
+# Build and print benchmark table
+benchmark_table <- rbind(
+  Full_Train = c(Variables = full_vars,
+                 Features  = full_feats,
+                 full_train_metrics),
+  Full_Test  = c(Variables = full_vars,
+                 Features  = full_feats,
+                 full_test_metrics),
+  Null_Train = c(Variables = null_vars,
+                 Features  = null_feats,
+                 null_train_metrics),
+  Null_Test  = c(Variables = null_vars,
+                 Features  = null_feats,
+                 null_test_metrics),
+  Sleep_Start_Train = c(Variables = sleep_start_vars,
+                        Features  = sleep_start_feats,
+                        sleep_start_train_metrics),
+  Sleep_Start_Test  = c(Variables = sleep_start_vars,
+                        Features  = sleep_start_feats,
+                        sleep_start_test_metrics)
+)
+
+print(benchmark_table)
+
+
+
+```
+
+
+
+
+```{r}
+# --- compute performance metrics for every model on TRAIN data ---
+# Create x_train matrix for glmnet models
+x_train <- model.matrix(~ . - is_sleep_deprived, data = train_data)[, -1]
+
+train_metrics_list <- list(
+  get_metrics(aic_forward_model,  train_data, train_data$is_sleep_deprived),
+  get_metrics(aic_backward_model, train_data, train_data$is_sleep_deprived),
+  get_metrics(aic_both_model,     train_data, train_data$is_sleep_deprived),
+  get_metrics(bic_forward_model,  train_data, train_data$is_sleep_deprived),
+  get_metrics(bic_backward_model, train_data, train_data$is_sleep_deprived),
+  get_metrics(bic_both_model,     train_data, train_data$is_sleep_deprived),
+  get_metrics_glmnet(final_lasso,   x_train, train_data$is_sleep_deprived),
+  get_metrics_glmnet(final_ridge,   x_train, train_data$is_sleep_deprived),
+  get_metrics_glmnet(final_elastic, x_train, train_data$is_sleep_deprived)
+)
+
+# Convert to data frame and rename columns for train metrics
+train_metrics_df <- as.data.frame(do.call(rbind, train_metrics_list))
+colnames(train_metrics_df) <- c("Train_AUC", "Train_F1", "Train_Accuracy", "Train_Sensitivity")
+
+# Add model names as a column
+train_metrics_df$Model <- c("AIC_Forward", "AIC_Backward", "AIC_Both", 
+                           "BIC_Forward", "BIC_Backward", "BIC_Both",
+                           "LASSO", "Ridge", "Elastic Net")
+
+# Reorder columns to make Model the first column
+train_metrics_df <- train_metrics_df[, c("Model", "Train_AUC", "Train_F1", "Train_Accuracy", "Train_Sensitivity")]
+
+# To merge with existing model_summary (if it exists)
+# model_summary <- merge(model_summary, train_metrics_df, by = "Model")
+
+# Otherwise, just print the training metrics
+print(train_metrics_df)
+```
+
+
+```{r}
+summary(bic_backward_model)
+```
+
+
+```{r}
+# Create a larger deviance residuals plot
+par(mfrow=c(1,1), mar=c(5,5,4,2), cex=1.2)
+
+dev_res <- residuals(bic_forward_model, type = "deviance")
+plot(predict(bic_forward_model), dev_res,
+    xlab = "Linear predictor", ylab = "Deviance residuals",
+    main = "Deviance residuals vs fitted values",
+    pch=19, cex=0.7)  # Solid points, slightly smaller for clarity
+abline(h = 0, lty = 2)
+
+# Add smoother line with wider span to see general trend
+smoothed <- loess(dev_res ~ predict(bic_forward_model), span=0.75)
+ord <- order(predict(bic_forward_model))
+lines(predict(bic_forward_model)[ord], predict(smoothed)[ord], 
+     col = "red", lwd = 2)
+```
+
+
+
+
+```{r}
+# Extract just the needed columns from each dataset for the analysis
+train_subset <- data.frame(
+  sleep_hour = as.numeric(as.character(train_data$sleep_time_weekdays_cat)),
+  is_sleep_deprived = train_data$is_sleep_deprived
+)
+test_subset <- data.frame(
+  sleep_hour = as.numeric(as.character(test_data$sleep_time_weekdays_cat)),
+  is_sleep_deprived = test_data$is_sleep_deprived
+)
+# Combine the subsets with only needed columns
+combined_subset <- rbind(train_subset, test_subset)
+# Aggregate data: calculate proportion of deprived by hour
+sleep_stats <- aggregate(
+  is_sleep_deprived ~ sleep_hour, 
+  data = combined_subset,
+  FUN = function(x) c(prop = mean(x), count = length(x))
+)
+# Convert to data frame with proper columns
+sleep_stats_df <- data.frame(
+  hour = sleep_stats$sleep_hour,
+  prop_deprived = sleep_stats$is_sleep_deprived[,1],
+  count = sleep_stats$is_sleep_deprived[,2]
+)
+# Sort by hour for proper display
+sleep_stats_df <- sleep_stats_df[order(sleep_stats_df$hour),]
+ggplot(sleep_stats_df) +
+  # Primary bars for proportion
+  geom_bar(aes(x = factor(hour), y = prop_deprived), 
+           fill = "#1d4f30", stat = "identity") +
+  # Secondary axis for count
+  geom_line(aes(x = factor(hour), y = count/max(count), group = 1), 
+            color = "red", size = 1, alpha = 0.7) +
+  # geom_point(aes(x = factor(hour), y = count/max(count)), 
+  #            color = "darkred", size = 2, alpha = 0.7) +
+  # Set up dual axis with simplified scale
+  scale_y_continuous(
+    name = "% Deprived",
+    limits = c(0, 1), 
+    breaks = seq(0, 1, 0.1),
+    sec.axis = sec_axis(~.*max(sleep_stats_df$count), 
+                        name = "Sample Count", 
+                        breaks = seq(0, ceiling(max(sleep_stats_df$count)/1000)*1000, 1000))
+  ) +
+  labs(
+    title = "Proportion of Deprived by Sleeping Start Hour",
+    x = "Sleep Start Hour"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    axis.text = element_text(size = 9),
+    axis.title.y.left = element_text(color = "#1d4f30"),
+    axis.title.y.right = element_text(color = "darkred"),
+    plot.title = element_text(hjust = 0.5)  # Center the title
+  )
+```
+
+```{r}
+get_metrics_at_thresholds <- function(model, data, y_true, thresholds) {
+  prob <- predict(model, newdata = data, type = "response")
+  auc <- roc(y_true, prob, quiet = TRUE)$auc
+  
+  results <- data.frame()
+  for (t in thresholds) {
+    pred <- factor(ifelse(prob > t, 1, 0), levels = c(0,1))
+    cm <- confusionMatrix(pred, factor(y_true, levels = c(0,1)), positive = "1")
+    
+    # Calculate actual prevalence from the data
+    prevalence <- sum(y_true == 1) / length(y_true)
+    
+    # Calculate percentage flagged as positive
+    true_pos_rate <- as.numeric(cm$byClass["Sensitivity"])
+    precision <- as.numeric(cm$byClass["Precision"])
+    true_positives <- true_pos_rate * prevalence
+    false_positives <- true_positives * (1/precision - 1)
+    percent_flagged <- (true_positives + false_positives) * 100
+    
+    results <- rbind(results, data.frame(
+      Threshold = t,
+      Precision = as.numeric(cm$byClass["Precision"]),
+      Recall = as.numeric(cm$byClass["Sensitivity"]),
+      F1 = as.numeric(cm$byClass["F1"]),
+      Accuracy = as.numeric(cm$overall["Accuracy"]),
+      # AUC = auc,
+      PercentFlagged = percent_flagged
+    ))
+  }
+  return(results)
+}
+
+# Create threshold table for BIC Forward Selection
+thresholds <- seq(0.15, 0.6, by = 0.05)
+bic_forward_thresholds <- get_metrics_at_thresholds(
+  bic_forward_model, X_test, y_test, thresholds
+)
+
+# Print formatted results
+print(bic_forward_thresholds, digits = 4)
+```
+```{r}
+cv_results <- data.frame(Fold = 1:k, Sensitivity = NA, Precision = NA, F1 = NA, AUC = NA)
+for (i in 1:k) {
+  # Get validation fold
+  valid_fold <- train_data[folds == i, ]
+  
+  # Get predictions
+  prob <- predict(bic_forward_model, newdata = valid_fold, type = "response")
+  pred <- factor(ifelse(prob > 0.5, 1, 0), levels = c(0,1))
+  
+  # Calculate metrics
+  auc <- roc(valid_fold$is_sleep_deprived, prob, quiet = TRUE)$auc
+  cm <- confusionMatrix(pred, factor(valid_fold$is_sleep_deprived, levels = c(0,1)), positive = "1")
+  
+  # Store results
+  cv_results$Sensitivity[i] <- cm$byClass["Sensitivity"]
+  cv_results$Precision[i] <- cm$byClass["Precision"]
+  cv_results$F1[i] <- cm$byClass["F1"]
+  cv_results$AUC[i] <- auc
+}
+
+# Calculate average and standard deviation
+cv_results <- rbind(
+  cv_results,
+  data.frame(
+    Fold = "Average", 
+    Sensitivity = mean(cv_results$Sensitivity), 
+    Precision = mean(cv_results$Precision),
+    F1 = mean(cv_results$F1),
+    AUC = mean(cv_results$AUC)
+  ),
+  data.frame(
+    Fold = "Standard Deviation", 
+    Sensitivity = sd(cv_results$Sensitivity), 
+    Precision = sd(cv_results$Precision),
+    F1 = sd(cv_results$F1),
+    AUC = sd(cv_results$AUC)
+  )
+)
+print(cv_results)
+```
+
+
+
+```{r}
+suppressWarnings(bic_forward_model_diag <- stepAIC(
+  null_model,
+  scope    = list(lower = null_model, upper = full_model),
+  direction= "forward",
+  k        = log(nrow(train_data)),
+  trace    = TRUE
+))
+```
+
+```{r}
+# Read the original data for untuned versions
+X_train_untuned <- read.csv("Dataset_final\\X_train.csv")
+y_train_untuned <- read.csv("Dataset_final\\y_train.csv")
+X_test_untuned <- read.csv("Dataset_final\\X_test.csv")
+y_test_untuned <- read.csv("Dataset_final\\y_test.csv")
+
+# Remove the index column (first column)
+X_train_untuned <- X_train_untuned[, -1]
+y_train_untuned <- y_train_untuned[, -1]
+X_test_untuned <- X_test_untuned[, -1]
+y_test_untuned <- y_test_untuned[, -1]
+
+# Remove another index column if it exists
+if(colnames(X_test_untuned)[1] == "") X_test_untuned <- X_test_untuned[, -1]
+
+# Create combined datasets
+train_data_untuned <- cbind(X_train_untuned, is_sleep_deprived = y_train_untuned)
+test_data_untuned <- cbind(X_test_untuned, is_sleep_deprived = y_test_untuned)
+
+# Fix untuned data
+train_data_untuned <- cbind(X_train_untuned, is_sleep_deprived = y_train_untuned)
+train_data_untuned$respondent_id <- NULL
+train_data_untuned$race_hispanic_origin <- NULL
+test_data_untuned <- cbind(X_test_untuned, is_sleep_deprived = y_test_untuned)
+test_data_untuned$respondent_id <- NULL
+test_data_untuned$race_hispanic_origin <- NULL
+
+# this one is feature_engineered. So I need to drop it for baseline.
+# colnames(test_data_untuned)[colnames(test_data_untuned) == "sleep_risk_category"] <- "weekday_sleep_timing"
+test_data_untuned$sleep_risk_category <- NULL
+train_data_untuned$sleep_risk_category <- NULL
+```
+
+```{r}
+full_model_untuned <- glm(is_sleep_deprived ~ .,
+                 data = train_data_untuned, 
+                 family = binomial(link = "logit"),
+                 weights = weights_vector)
+
+summary(full_model_untuned)
+```
+```{r}
+# Compute test metrics for untuned model
+full_model_untuned_test_metrics <- get_metrics(full_model_untuned, X_test_untuned, y_test_untuned)
+
+# Compute train metrics for untuned model
+full_model_untuned_train_metrics <- get_metrics(full_model_untuned, train_data_untuned, train_data_untuned$is_sleep_deprived)
+
+# Count variables & features for untuned model
+x_full_untuned <- model.matrix(is_sleep_deprived ~ ., train_data_untuned)[,-1]
+y_full_untuned <- train_data_untuned$is_sleep_deprived
+full_model_untuned_vars <- count_original_variables(full_model_untuned)
+full_model_untuned_feats <- ncol(x_full_untuned) # Assuming x_full_untuned exists
+
+# Add to benchmark table
+benchmark_table_with_untuned <- rbind(
+  benchmark_table,
+  Full_Untuned_Train = c(Variables = full_model_untuned_vars,
+                         Features = full_model_untuned_feats,
+                         full_model_untuned_train_metrics),
+  Full_Untuned_Test = c(Variables = full_model_untuned_vars,
+                        Features = full_model_untuned_feats,
+                        full_model_untuned_test_metrics)
+)
+
+print(benchmark_table_with_untuned)
+```
+
+
+```{r}
+# Calculate percentages by weekday_sleep_timing and gender
+summary_data <- train_data %>%
+  group_by(weekday_sleep_timing, gender) %>%
+  summarize(
+    n = n(),
+    pct_deprived = mean(is_sleep_deprived) * 100,
+    .groups = 'drop'
+  )
+
+# Create the plot with theme matching your slides
+ggplot(summary_data, aes(x = weekday_sleep_timing, y = pct_deprived, fill = gender)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.8) +
+  # Percentages - all in black and rounded to whole numbers
+  geom_text(aes(label = paste0(round(pct_deprived, 0), "%")), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.5, 
+            size = 3.5,
+            color = "black") +
+  # Sample sizes - conditionally colored
+  geom_text(aes(label = paste0("n=", n), 
+                color = gender == "Male"), 
+            position = position_dodge(width = 0.9), 
+            vjust = 2, 
+            size = 3) +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "white"), guide = "none") +
+  # Using a dark green/gray color scheme to match your example slides
+  scale_fill_manual(values = c("Female" = "#cccccc", "Male" = "#1d4f30")) +
+  labs(
+    title = "Interaction: weekday_sleep_timing × Gender → Sleep Deprivation",
+    x = "",
+    y = "% Sleep Deprived",
+    fill = "Gender"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, size = 14),
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    axis.text = element_text(size = 10),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  ) +
+  ylim(0, 100)  # Set y-axis from 0 to 100%
+```
+
+```{r}
+# Calculate percentages by weekday_sleep_timing and race
+summary_data <- train_data %>%
+  group_by(weekday_sleep_timing, race_hispanic_origin_with_asian) %>%
+  summarize(
+    n = n(),
+    pct_deprived = mean(is_sleep_deprived) * 100,
+    .groups = 'drop'
+  )
+
+# Keep only the races with significant sample sizes
+# (We'll filter out any with very small sample sizes to make the plot clearer)
+filtered_data <- summary_data %>%
+  filter(n >= 100)  # Adjust this threshold as needed
+
+# Create the plot with theme matching your slides
+ggplot(filtered_data, aes(x = weekday_sleep_timing, y = pct_deprived, 
+                         fill = race_hispanic_origin_with_asian)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.8) +
+  geom_text(aes(label = paste0(round(pct_deprived, 1), "%"),
+                color = race_hispanic_origin_with_asian %in% c("Non-Hispanic Black")), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.5, 
+            size = 3) +
+  geom_text(aes(label = paste0("n=", n),
+                color = race_hispanic_origin_with_asian %in% c("Non-Hispanic Black")), 
+            position = position_dodge(width = 0.9), 
+            vjust = 2, 
+            size = 2.5) +
+  # Using a color scheme consistent with your other plots
+  scale_fill_manual(values = c(
+    "Non-Hispanic White" = "#cccccc",
+    "Non-Hispanic Black" = "#1d4f30",
+    "Mexican American" = "#5a9178",
+    "Other Hispanic" = "#8fb5a3",
+    "Other/Multi-Racial" = "#b3d1c2"
+  )) +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "blue"), guide = "none") +
+  labs(
+    title = "Interaction: weekday_sleep_timing × Race → Sleep Deprivation",
+    x = "",
+    y = "% Sleep Deprived",
+    fill = "Race/Ethnicity"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, size = 14),
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    axis.text = element_text(size = 10),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 9)
+  ) +
+  ylim(0, 100)  # Set y-axis from 0 to 100%
+```
+
